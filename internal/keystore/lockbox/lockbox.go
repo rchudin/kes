@@ -1,6 +1,7 @@
 package lockbox
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -108,6 +109,7 @@ func (t *authTransport) auth(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to create request: %w", err)
 	}
+
 	req.Header.Set(headers.ContentType, "application/json")
 
 	var resp authResponse
@@ -180,7 +182,38 @@ func (s *Store) Status(ctx context.Context) (kes.KeyStoreState, error) {
 // if the given key does not exist. If such an entry already exists
 // it returns kes.ErrKeyExists.
 func (s *Store) Create(ctx context.Context, name string, value []byte) error {
-	panic("not implemented")
+	body, err := json.Marshal(createRequest{
+		FolderId: s.folderID,
+		Name:     name,
+		VersionPayloadEntries: []*entry{
+			{
+				Key:         "value",
+				BinaryValue: value,
+			},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		fmt.Sprintf("https://lockbox.%s/lockbox/v1/secrets", s.endpoint),
+		bytes.NewReader(body),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set(headers.ContentType, "application/json")
+
+	err = s.do(req, nil)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // Get returns the value associated with the given key.
@@ -221,8 +254,8 @@ func (s *Store) Get(ctx context.Context, name string) ([]byte, error) {
 		return nil, fmt.Errorf("entry value not found")
 	}
 
-	if len(sec.Entries[0].TextValue) > 0 {
-		return []byte(sec.Entries[0].TextValue), nil
+	if len(sec.Entries[0].BinaryValue) > 0 {
+		return sec.Entries[0].BinaryValue, nil
 	}
 
 	return nil, fmt.Errorf("entry value is empty")
@@ -343,6 +376,10 @@ func do(client *http.Client, req *http.Request, dst interface{}) error {
 		return fmt.Errorf("unexpected status code %d", resp.StatusCode)
 	}
 
+	if dst == nil {
+		return nil
+	}
+
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return err
@@ -372,11 +409,17 @@ type secret struct {
 }
 
 type entry struct {
-	Key       string `json:"key"`
-	TextValue string `json:"textValue"`
+	Key         string `json:"key,omitempty"`
+	BinaryValue []byte `json:"binaryValue,string,omitempty"`
 }
 
 type listResponse struct {
-	Secrets       []*secret `json:"secrets"`
-	NextPageToken string    `json:"nextPageToken"`
+	Secrets       []*secret `json:"secrets,omitempty"`
+	NextPageToken string    `json:"nextPageToken,omitempty"`
+}
+
+type createRequest struct {
+	FolderId              string   `json:"folderId,omitempty"`
+	Name                  string   `json:"name,omitempty"`
+	VersionPayloadEntries []*entry `json:"versionPayloadEntries,omitempty"`
 }
