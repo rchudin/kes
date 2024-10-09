@@ -65,11 +65,13 @@ func (t *authTransport) get(ctx context.Context) (string, error) {
 }
 
 func (t *authTransport) auth(ctx context.Context) (string, error) {
+	now := time.Now().UTC()
+
 	claims := jwt.RegisteredClaims{
 		Issuer:    t.accountID,
-		ExpiresAt: jwt.NewNumericDate(time.Now().UTC().Add(1 * time.Hour)),
-		IssuedAt:  jwt.NewNumericDate(time.Now().UTC()),
-		NotBefore: jwt.NewNumericDate(time.Now().UTC()),
+		ExpiresAt: jwt.NewNumericDate(now.Add(1 * time.Hour)),
+		IssuedAt:  jwt.NewNumericDate(now),
+		NotBefore: jwt.NewNumericDate(now),
 		Audience:  []string{fmt.Sprintf("https://iam.%s/iam/v1/tokens", t.endpoint)},
 	}
 
@@ -103,12 +105,19 @@ func (t *authTransport) auth(ctx context.Context) (string, error) {
 		fmt.Sprintf("https://iam.%s/iam/v1/tokens", t.endpoint),
 		strings.NewReader(fmt.Sprintf(`{"jwt":"%s"}`, signed)),
 	)
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %w", err)
+	}
 	req.Header.Set(headers.ContentType, "application/json")
 
 	var resp authResponse
 	err = do(http.DefaultClient, req, &resp)
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch token: %w", err)
+	}
+
+	if len(resp.IAMToken) < 1 {
+		return "", fmt.Errorf("failed to fetch token: no IAM token is empty")
 	}
 
 	return resp.IAMToken, nil
@@ -177,7 +186,46 @@ func (s *Store) Create(ctx context.Context, name string, value []byte) error {
 // Get returns the value associated with the given key.
 // If no entry for the key exists it returns kes.ErrKeyNotFound.
 func (s *Store) Get(ctx context.Context, name string) ([]byte, error) {
-	panic("not implemented")
+	secretID, ok := s.cacheSecretsIDs.Get(name)
+	if !ok {
+		sec, err := s.find(ctx, name)
+		if err != nil {
+			return nil, err
+		}
+
+		secretID = sec.ID
+		s.cacheSecretsIDs.Add(name, secretID)
+	}
+
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodGet,
+		fmt.Sprintf("https://payload.lockbox.%s/lockbox/v1/secrets/%s/payload", s.endpoint, secretID),
+		nil,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	var sec *secret
+	err = s.do(req, &sec)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch secret: %w", err)
+	}
+
+	if len(sec.Entries) != 1 {
+		return nil, fmt.Errorf("failed to fetch secret: expected 1 entry, got %d", len(sec.Entries))
+	}
+
+	if sec.Entries[0].Key != "value" {
+		return nil, fmt.Errorf("entry value not found")
+	}
+
+	if len(sec.Entries[0].TextValue) > 0 {
+		return []byte(sec.Entries[0].TextValue), nil
+	}
+
+	return nil, fmt.Errorf("entry value is empty")
 }
 
 // Delete removes a the value associated with the given key
@@ -317,9 +365,15 @@ type authResponse struct {
 }
 
 type secret struct {
-	ID       string `json:"id,omitempty"`
-	FolderID string `json:"folderId,omitempty"`
-	Name     string `json:"name,omitempty"`
+	ID       string   `json:"id,omitempty"`
+	FolderID string   `json:"folderId,omitempty"`
+	Name     string   `json:"name,omitempty"`
+	Entries  []*entry `json:"entries,omitempty"`
+}
+
+type entry struct {
+	Key       string `json:"key"`
+	TextValue string `json:"textValue"`
 }
 
 type listResponse struct {
