@@ -27,6 +27,7 @@ import (
 	"github.com/minio/kes/internal/keystore/fs"
 	"github.com/minio/kes/internal/keystore/gcp"
 	"github.com/minio/kes/internal/keystore/gemalto"
+	"github.com/minio/kes/internal/keystore/lockbox"
 	"github.com/minio/kes/internal/keystore/vault"
 	kesdk "github.com/minio/kms-go/kes"
 	yaml "gopkg.in/yaml.v3"
@@ -826,5 +827,26 @@ func (s *EntrustKeyControlKeyStore) Connect(ctx context.Context) (kes.KeyStore, 
 		TLS: &tls.Config{
 			RootCAs: rootCAs,
 		},
+	})
+}
+
+// YandexLockBoxStore is a structure containing the configuration
+// for Yandex LockBox.
+type YandexLockBoxStore struct {
+	Endpoint  string
+	FolderID  string
+	AccountID string
+	KeyID     string
+	KeyFile   string
+}
+
+// Connect returns a kv.Store that stores key-value pairs on Yandex LockBox.
+func (s *YandexLockBoxStore) Connect(_ context.Context) (kes.KeyStore, error) {
+	return lockbox.Connect(&lockbox.Config{
+		Endpoint:  s.Endpoint,
+		FolderID:  s.FolderID,
+		AccountID: s.AccountID,
+		KeyID:     s.KeyID,
+		KeyFile:   s.KeyFile,
 	})
 }

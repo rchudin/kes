@@ -208,6 +208,13 @@ type ymlFile struct {
 				} `yaml:"tls"`
 			} `yaml:"keycontrol"`
 		} `yaml:"entrust"`
+		LockBox *struct {
+			Endpoint  env[string] `yaml:"endpoint"`
+			FolderID  env[string] `yaml:"folder_id"`
+			AccountID env[string] `yaml:"account_id"`
+			KeyID     env[string] `yaml:"key_id"`
+			KeyFile   env[string] `yaml:"key_file"`
+		} `yaml:"lockbox"`
 	} `yaml:"keystore"`
 }
 
@@ -653,6 +660,35 @@ func ymlToKeyStore(y *ymlFile) (KeyStore, error) {
 			Username: y.KeyStore.Entrust.KeyControl.Login.Username.Value,
 			Password: y.KeyStore.Entrust.KeyControl.Login.Password.Value,
 			CAPath:   y.KeyStore.Entrust.KeyControl.TLS.CAPath.Value,
+		}
+	}
+
+	if y.KeyStore.LockBox != nil {
+		if keystore != nil {
+			return nil, errors.New("kesconf: invalid keystore config: more than once keystore specified")
+		}
+		if y.KeyStore.LockBox.Endpoint.Value == "" {
+			return nil, errors.New("kesconf: invalid LockBox keystore: no endpoint specified")
+		}
+		if y.KeyStore.LockBox.FolderID.Value == "" {
+			return nil, errors.New("kesconf: invalid LockBox keystore: no folder ID specified")
+		}
+		if y.KeyStore.LockBox.AccountID.Value == "" {
+			return nil, errors.New("kesconf: invalid LockBox keystore: no account ID specified")
+		}
+		if y.KeyStore.LockBox.KeyID.Value == "" {
+			return nil, errors.New("kesconf: invalid LockBox keystore: no key ID specified")
+		}
+		if y.KeyStore.LockBox.KeyFile.Value == "" {
+			return nil, errors.New("kesconf: invalid LockBox keystore: no key file specified")
+		}
+
+		keystore = &YandexLockBoxStore{
+			Endpoint:  y.KeyStore.LockBox.Endpoint.Value,
+			FolderID:  y.KeyStore.LockBox.FolderID.Value,
+			AccountID: y.KeyStore.LockBox.AccountID.Value,
+			KeyID:     y.KeyStore.LockBox.KeyID.Value,
+			KeyFile:   y.KeyStore.LockBox.KeyFile.Value,
 		}
 	}
 

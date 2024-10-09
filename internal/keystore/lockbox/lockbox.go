@@ -4,23 +4,28 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/minio/kes/internal/keystore"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/minio/kes"
+	"github.com/minio/kes/internal/headers"
 	xhttp "github.com/minio/kes/internal/http"
+	"github.com/minio/kes/internal/keystore"
 )
 
 type Config struct {
-	endpoint string
-	folderID string
-	//token string
-
+	Endpoint  string
+	FolderID  string
+	AccountID string
+	KeyID     string
+	KeyFile   string
 }
 
 type Store struct {
@@ -31,28 +36,113 @@ type Store struct {
 }
 
 type authTransport struct {
-	token string
-	next  http.RoundTripper
+	next      http.RoundTripper
+	endpoint  string
+	accountID string
+	keyID     string
+	keyFile   string
+	token     string
+	expire    time.Time
+	mu        sync.Mutex
+}
+
+func (t *authTransport) get(ctx context.Context) (string, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if len(t.token) > 0 && t.expire.After(time.Now()) {
+		return t.token, nil
+	}
+
+	token, err := t.auth(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	t.token = token
+	t.expire = time.Now().Add(10 * time.Hour)
+	return t.token, nil
+}
+
+func (t *authTransport) auth(ctx context.Context) (string, error) {
+	claims := jwt.RegisteredClaims{
+		Issuer:    t.accountID,
+		ExpiresAt: jwt.NewNumericDate(time.Now().UTC().Add(1 * time.Hour)),
+		IssuedAt:  jwt.NewNumericDate(time.Now().UTC()),
+		NotBefore: jwt.NewNumericDate(time.Now().UTC()),
+		Audience:  []string{fmt.Sprintf("https://iam.%s/iam/v1/tokens", t.endpoint)},
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodPS256, claims)
+	token.Header["kid"] = t.keyID
+
+	data, err := os.ReadFile(t.keyFile)
+	if err != nil {
+		return "", fmt.Errorf("failed to read key file: %w", err)
+	}
+
+	var keyData key
+	err = json.Unmarshal(data, &keyData)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse key file: %w", err)
+	}
+
+	privateKey, err := jwt.ParseRSAPrivateKeyFromPEM([]byte(keyData.PrivateKey))
+	if err != nil {
+		return "", fmt.Errorf("failed to parse private key: %w", err)
+	}
+
+	signed, err := token.SignedString(privateKey)
+	if err != nil {
+		return "", fmt.Errorf("failed to sign token: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		fmt.Sprintf("https://iam.%s/iam/v1/tokens", t.endpoint),
+		strings.NewReader(fmt.Sprintf(`{"jwt":"%s"}`, signed)),
+	)
+	req.Header.Set(headers.ContentType, "application/json")
+
+	var resp authResponse
+	err = do(http.DefaultClient, req, &resp)
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch token: %w", err)
+	}
+
+	return resp.IAMToken, nil
 }
 
 func (t *authTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	req.Header.Set("Authorization", "Bearer "+t.token)
+	token, err := t.get(req.Context())
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("Authorization", "Bearer "+token)
 
 	return t.next.RoundTrip(req)
 }
 
 func Connect(config *Config) (*Store, error) {
-	return &Store{
+	s := Store{
 		cacheSecretsIDs: expirable.NewLRU[string, string](25, nil, 10*time.Minute),
-		client: &http.Client{
-			Transport: &authTransport{
-				token: token,
-				next:  http.DefaultTransport,
-			},
+		endpoint:        config.Endpoint,
+		folderID:        config.FolderID,
+	}
+
+	s.client = &http.Client{
+		Transport: &authTransport{
+			next:      http.DefaultTransport,
+			endpoint:  config.Endpoint,
+			accountID: config.AccountID,
+			keyID:     config.KeyID,
+			keyFile:   config.KeyFile,
 		},
-		endpoint: config.endpoint,
-		folderID: config.folderID,
-	}, nil
+	}
+
+	return &s, nil
 }
 
 func (s *Store) String() string {
@@ -156,20 +246,20 @@ func (s *Store) list(ctx context.Context, prefix string, n int) ([]*secret, erro
 			query.Set("pageToken", nextToken)
 		}
 
-		link := fmt.Sprintf("https://%s/lockbox/v1/secrets?%s", s.endpoint, query.Encode())
+		link := fmt.Sprintf("https://lockbox.%s/lockbox/v1/secrets?%s", s.endpoint, query.Encode())
 
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, link, nil)
 		if err != nil {
 			return nil, err
 		}
 
-		var next listResponse
-		err = s.do(req, &secrets)
+		var resp listResponse
+		err = s.do(req, &resp)
 		if err != nil {
 			return nil, err
 		}
 
-		for _, sec := range next.Secrets {
+		for _, sec := range resp.Secrets {
 			if len(secrets) == n {
 				return secrets, nil
 			}
@@ -181,7 +271,7 @@ func (s *Store) list(ctx context.Context, prefix string, n int) ([]*secret, erro
 			secrets = append(secrets, sec)
 		}
 
-		nextToken = next.NextPageToken
+		nextToken = resp.NextPageToken
 		if len(nextToken) < 1 {
 			return secrets, nil
 		}
@@ -191,7 +281,11 @@ func (s *Store) list(ctx context.Context, prefix string, n int) ([]*secret, erro
 }
 
 func (s *Store) do(req *http.Request, dst interface{}) error {
-	resp, err := s.client.Do(req)
+	return do(s.client, req, dst)
+}
+
+func do(client *http.Client, req *http.Request, dst interface{}) error {
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -212,6 +306,14 @@ func (s *Store) do(req *http.Request, dst interface{}) error {
 	}
 
 	return nil
+}
+
+type key struct {
+	PrivateKey string `json:"private_key"`
+}
+
+type authResponse struct {
+	IAMToken string `json:"iamToken"`
 }
 
 type secret struct {
