@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/minio/kes/internal/keystore"
 	"io"
 	"net/http"
 	"net/url"
@@ -13,19 +14,20 @@ import (
 	"github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/minio/kes"
 	xhttp "github.com/minio/kes/internal/http"
-	"github.com/minio/kes/internal/keystore"
 )
 
 type Config struct {
-	// token string
+	endpoint string
+	folderID string
+	//token string
 
-	folderId string
 }
 
 type Store struct {
-	cacheSecretsIds *expirable.LRU[string, string]
+	cacheSecretsIDs *expirable.LRU[string, string]
 	client          *http.Client
-	folderId        string
+	endpoint        string
+	folderID        string
 }
 
 type authTransport struct {
@@ -41,15 +43,15 @@ func (t *authTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 func Connect(config *Config) (*Store, error) {
 	return &Store{
-		cacheSecretsIds: expirable.NewLRU[string, string](25, nil, 10*time.Minute),
+		cacheSecretsIDs: expirable.NewLRU[string, string](25, nil, 10*time.Minute),
 		client: &http.Client{
 			Transport: &authTransport{
 				token: token,
 				next:  http.DefaultTransport,
 			},
 		},
-
-		folderId: config.folderId,
+		endpoint: config.endpoint,
+		folderID: config.folderID,
 	}, nil
 }
 
@@ -63,17 +65,12 @@ func (s *Store) Close() error { return nil }
 // Status returns the current state of the Yandex LockBox instance.
 // In particular, whether it is reachable and the network latency.
 func (s *Store) Status(ctx context.Context) (kes.KeyStoreState, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.endpoint, nil)
-	if err != nil {
-		return kes.KeyStoreState{}, err
-	}
-
 	start := time.Now()
-	resp, err := s.client.Do(req)
+
+	_, err := s.list(ctx, "ping", 0)
 	if err != nil {
 		return kes.KeyStoreState{}, &keystore.ErrUnreachable{Err: err}
 	}
-	defer xhttp.DrainBody(resp.Body)
 
 	return kes.KeyStoreState{
 		Latency: time.Since(start),
@@ -96,7 +93,7 @@ func (s *Store) Get(ctx context.Context, name string) ([]byte, error) {
 // Delete removes a the value associated with the given key
 // from Yandex LockBox, if it exists.
 func (s *Store) Delete(ctx context.Context, name string) error {
-	return fmt.Errorf("not implemented")
+	return &keystore.ErrUnreachable{Err: fmt.Errorf("not implemented")}
 }
 
 // List returns the first n key names, that start with the given
@@ -111,12 +108,12 @@ func (s *Store) Delete(ctx context.Context, name string) error {
 // returned prefix is empty.
 func (s *Store) List(ctx context.Context, prefix string, n int) ([]string, string, error) {
 	if n > -1 {
-		return nil, "", fmt.Errorf("cannot list than %d items", n)
+		return nil, "", &keystore.ErrUnreachable{Err: fmt.Errorf("cannot list than %d items", n)}
 	}
 
-	secrets, err := s.list(ctx, prefix)
+	secrets, err := s.list(ctx, prefix, n)
 	if err != nil {
-		return nil, "", err
+		return nil, "", &keystore.ErrUnreachable{Err: err}
 	}
 
 	names := make([]string, 0, len(secrets))
@@ -128,7 +125,7 @@ func (s *Store) List(ctx context.Context, prefix string, n int) ([]string, strin
 }
 
 func (s *Store) find(ctx context.Context, name string) (*secret, error) {
-	secrets, err := s.list(ctx, name)
+	secrets, err := s.list(ctx, name, -1)
 	if err != nil {
 		return nil, err
 	}
@@ -144,9 +141,9 @@ func (s *Store) find(ctx context.Context, name string) (*secret, error) {
 	return nil, fmt.Errorf("secret %s not found", name)
 }
 
-func (s *Store) list(ctx context.Context, prefix string) ([]*secret, error) {
+func (s *Store) list(ctx context.Context, prefix string, n int) ([]*secret, error) {
 	query := url.Values{
-		"folderId": []string{s.folderId},
+		"folderId": []string{s.folderID},
 	}
 
 	var (
@@ -159,7 +156,7 @@ func (s *Store) list(ctx context.Context, prefix string) ([]*secret, error) {
 			query.Set("pageToken", nextToken)
 		}
 
-		link := fmt.Sprintf("https://lockbox.api.cloud.yandex.net/lockbox/v1/secrets?%s", query.Encode())
+		link := fmt.Sprintf("https://%s/lockbox/v1/secrets?%s", s.endpoint, query.Encode())
 
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, link, nil)
 		if err != nil {
@@ -173,6 +170,10 @@ func (s *Store) list(ctx context.Context, prefix string) ([]*secret, error) {
 		}
 
 		for _, sec := range next.Secrets {
+			if len(secrets) == n {
+				return secrets, nil
+			}
+
 			if !strings.HasPrefix(sec.Name, prefix) {
 				continue
 			}
@@ -194,7 +195,7 @@ func (s *Store) do(req *http.Request, dst interface{}) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer xhttp.DrainBody(resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("unexpected status code %d", resp.StatusCode)
@@ -214,8 +215,8 @@ func (s *Store) do(req *http.Request, dst interface{}) error {
 }
 
 type secret struct {
-	Id       string `json:"id,omitempty"`
-	FolderId string `json:"folderId,omitempty"`
+	ID       string `json:"id,omitempty"`
+	FolderID string `json:"folderId,omitempty"`
 	Name     string `json:"name,omitempty"`
 }
 
