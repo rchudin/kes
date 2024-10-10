@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -19,6 +20,7 @@ import (
 	"github.com/minio/kes/internal/headers"
 	xhttp "github.com/minio/kes/internal/http"
 	"github.com/minio/kes/internal/keystore"
+	kms "github.com/minio/kms-go/kes"
 )
 
 type Config struct {
@@ -182,6 +184,14 @@ func (s *Store) Status(ctx context.Context) (kes.KeyStoreState, error) {
 // if the given key does not exist. If such an entry already exists
 // it returns kes.ErrKeyExists.
 func (s *Store) Create(ctx context.Context, name string, value []byte) error {
+	_, err := s.find(ctx, name)
+	if err == nil {
+		return kms.ErrKeyExists
+	}
+	if !errors.Is(err, kms.ErrKeyNotFound) {
+		return fmt.Errorf("failed to find key: %w", err)
+	}
+
 	body, err := json.Marshal(createRequest{
 		FolderId: s.folderID,
 		Name:     name,
@@ -210,7 +220,7 @@ func (s *Store) Create(ctx context.Context, name string, value []byte) error {
 
 	err = s.do(req, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to do request: %w", err)
 	}
 
 	return nil
@@ -243,7 +253,7 @@ func (s *Store) Get(ctx context.Context, name string) ([]byte, error) {
 	var sec *secret
 	err = s.do(req, &sec)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch secret: %w", err)
+		return nil, fmt.Errorf("failed to do request: %w", err)
 	}
 
 	if len(sec.Entries) != 1 {
@@ -264,7 +274,7 @@ func (s *Store) Get(ctx context.Context, name string) ([]byte, error) {
 // Delete removes a the value associated with the given key
 // from Yandex LockBox, if it exists.
 func (s *Store) Delete(ctx context.Context, name string) error {
-	return &keystore.ErrUnreachable{Err: fmt.Errorf("not implemented")}
+	return fmt.Errorf("not implemented")
 }
 
 // List returns the first n key names, that start with the given
@@ -279,12 +289,12 @@ func (s *Store) Delete(ctx context.Context, name string) error {
 // returned prefix is empty.
 func (s *Store) List(ctx context.Context, prefix string, n int) ([]string, string, error) {
 	if n > -1 {
-		return nil, "", &keystore.ErrUnreachable{Err: fmt.Errorf("cannot list than %d items", n)}
+		return nil, "", fmt.Errorf("cannot list than %d items", n)
 	}
 
 	secrets, err := s.list(ctx, prefix, n)
 	if err != nil {
-		return nil, "", &keystore.ErrUnreachable{Err: err}
+		return nil, "", err
 	}
 
 	names := make([]string, 0, len(secrets))
@@ -309,7 +319,7 @@ func (s *Store) find(ctx context.Context, name string) (*secret, error) {
 		return sec, nil
 	}
 
-	return nil, fmt.Errorf("secret %s not found", name)
+	return nil, kms.ErrKeyNotFound
 }
 
 func (s *Store) list(ctx context.Context, prefix string, n int) ([]*secret, error) {
@@ -337,7 +347,7 @@ func (s *Store) list(ctx context.Context, prefix string, n int) ([]*secret, erro
 		var resp listResponse
 		err = s.do(req, &resp)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to fetch secrets: %w", err)
 		}
 
 		for _, sec := range resp.Secrets {
@@ -368,7 +378,7 @@ func (s *Store) do(req *http.Request, dst interface{}) error {
 func do(client *http.Client, req *http.Request, dst interface{}) error {
 	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to do request: %w", err)
 	}
 	defer xhttp.DrainBody(resp.Body)
 
